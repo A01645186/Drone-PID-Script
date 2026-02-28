@@ -1,0 +1,368 @@
+clear; clc; close all;
+
+%% Parámetros del "mapa"
+P.mapSize_km   = 50;     % 50x50 km
+P.cell_km      = 1;      % tamaño de celda 
+
+% Modo de misión 
+P.mission = "fire"; 
+
+switch P.mission
+    case "fire"
+        P.footprint_cells = 5;   % 5x5
+    case "person"
+        P.footprint_cells = 3;   % 3x3
+end
+P.footprint_km = P.footprint_cells * P.cell_km;
+P.passSpacing_km = P.footprint_km;     % separacion entre pasadas 
+P.margin_km = 0.5;                     % margen interior para no salirte 
+
+%% Tiempo y dinámica
+Ts = 0.1;              % paso de simulación (s)
+Tend = 1400;           % duración (s) 
+t = 0:Ts:Tend;
+N = numel(t);
+
+P.tau_v = 1.0;         % constante de tiempo en seguimiento de velocidad (s)
+P.Vmax  = 0.20;        % velocidad máxima (km/s) = 720 km/h 
+                        % Si quieres 20 m/s: 0.02 km/s.
+
+% Ajuste recomendado: para dron realista, usa por ejemplo Vmax=0.02 km/s.
+
+%% Disturbios (en aceleración equivalente, km/s^2)
+% Senoidal
+D.Ax = 0.0015;          % amplitud (km/s^2)
+D.fx = 0.02;            % Hz
+D.phix = 0.0;
+
+D.Ay = 0.0010;
+D.fy = 0.015;
+D.phiy = 1.0;
+
+% "Turbulencia" como ruido coloreado 
+D.sigma_turb = 0.0008;  % km/s^2 (intensidad)
+D.tau_turb   = 3.0;     % s (tiempo de correlación)
+
+%% Sensores
+S.gpsPeriod_s = 15;            % GPS cada 15 s
+S.trkBound_km = 0.25;          % +/-0.25 km (tracking interno)
+
+% GPS:
+S.gpsSigmaGood_km = 0.01;
+S.gpsSigmaBad_km  = 0.60;      % > 0.25 km
+S.pBadGPS         = 0.08;      % prob. de "solución mala" cuando hay update
+
+% Disponibilidad GPS
+S.pGPSavailable   = 0.85;
+
+%% Controlador 
+CTRL.type = "PID"; 
+
+% Ganancias valores iniciales;
+CTRL.Kp = 0.08;    % (km/s)/km
+CTRL.Ki = 0.01;    % (km/s)/(km*s)
+CTRL.Kd = 0.12;    % (km/s)/(km/s)
+
+% Anti-windup simple
+CTRL.Imax = 2.0;   % límite integral (km*s)
+
+%% Generar trayectoria zig-zag (waypoints) en km
+wps = generateZigZagWaypoints(P.mapSize_km, P.margin_km, P.passSpacing_km);
+% Convertir waypoints a referencia continua x_ref(t), y_ref(t) siguiendo segmentos
+ref = makeReferenceFromWaypoints(wps, t, P.Vmax*0.8); 
+
+%% Estado real [x;y;vx;vy]
+xTrue = zeros(4,N);
+xTrue(:,1) = [P.margin_km; P.margin_km; 0; 0];
+
+%% Estados estimados (Kalman)
+% Modelo discreto lineal con entrada v_cmd (a través de primer orden en v)
+% Usamos estado [x;y;vx;vy], entrada u=[vx_cmd;vy_cmd], y disturbio como ruido de proceso.
+
+A = [1 0 Ts 0;
+     0 1 0 Ts;
+     0 0 (1 - Ts/P.tau_v) 0;
+     0 0 0 (1 - Ts/P.tau_v)];
+B = [0 0;
+     0 0;
+     Ts/P.tau_v 0;
+     0 Ts/P.tau_v];
+
+H = [1 0 0 0;
+     0 1 0 0];
+
+% Covarianzas 
+Q = diag([1e-6, 1e-6, 5e-5, 5e-5]); % proceso
+R_gps_good = (S.gpsSigmaGood_km^2)*eye(2);
+R_gps_bad  = (S.gpsSigmaBad_km^2)*eye(2);
+R_trk      = ((S.trkBound_km/sqrt(3))^2)*eye(2); % uniforme -> var = a^2/3
+
+xHat = zeros(4,N);
+PHat = 0.1*eye(4);
+xHat(:,1) = xTrue(:,1);
+
+%% Logs
+vCmdLog = zeros(2,N);
+zLog    = nan(2,N);
+zType   = strings(1,N);
+
+%% Control integradores
+Ix = 0; Iy = 0;
+exPrev = 0; eyPrev = 0;
+
+%% Turbulencia (ruido coloreado) con filtro 1er orden sobre blanco
+turb_x = 0; turb_y = 0;
+
+rng(7); % reproducible
+
+%% Simulación
+for k = 2:N
+    % ---- Referencia
+    xref = ref.x(k);
+    yref = ref.y(k);
+
+    % ---- Medición disponible: GPS (en instantes) o tracking
+    isGPSupdateTime = (mod(t(k), S.gpsPeriod_s) < 1e-9);
+
+    if isGPSupdateTime && (rand < S.pGPSavailable)
+        % GPS 
+        if rand < S.pBadGPS
+            noise = S.gpsSigmaBad_km*randn(2,1);
+            zType(k) = "GPS_BAD";
+        else
+            noise = S.gpsSigmaGood_km*randn(2,1);
+            zType(k) = "GPS_GOOD";
+        end
+        z = xTrue(1:2,k-1) + noise;
+        zLog(:,k) = z;
+    else
+        % Tracking interno (cuando no hay GPS)
+        z = xTrue(1:2,k-1) + (2*rand(2,1)-1)*S.trkBound_km; % uniforme [-a,a]
+        zType(k) = "TRACK";
+        zLog(:,k) = z;
+    end
+
+    % ---- Kalman: Predicción
+    u_prev = vCmdLog(:,k-1);
+    xPred = A*xHat(:,k-1) + B*u_prev;
+    PPred = A*PHat*A' + Q;
+
+    % ---- Kalman: Actualización (siempre hay z, pero con distinta R)
+    switch zType(k)
+        case "GPS_GOOD"
+            R = R_gps_good;
+        case "GPS_BAD"
+            R = R_gps_bad;
+        otherwise
+            R = R_trk;
+    end
+
+    S_k = H*PPred*H' + R;
+    K_k = (PPred*H')/S_k;
+    xHat(:,k) = xPred + K_k*(z - H*xPred);
+    PHat = (eye(4) - K_k*H)*PPred;
+
+    % ---- Control (sobre estado estimado)
+    ex = xref - xHat(1,k);
+    ey = yref - xHat(2,k);
+
+    % Integral
+    if CTRL.type == "PI" || CTRL.type == "PID"
+        Ix = Ix + ex*Ts;
+        Iy = Iy + ey*Ts;
+        Ix = max(min(Ix, CTRL.Imax), -CTRL.Imax);
+        Iy = max(min(Iy, CTRL.Imax), -CTRL.Imax);
+    else
+        Ix = 0; Iy = 0;
+    end
+
+    % Derivada
+    if CTRL.type == "PID"
+        dex = (ex - exPrev)/Ts;
+        dey = (ey - eyPrev)/Ts;
+    else
+        dex = 0; dey = 0;
+    end
+    exPrev = ex; eyPrev = ey;
+
+    vx_cmd = CTRL.Kp*ex + CTRL.Ki*Ix + CTRL.Kd*dex;
+    vy_cmd = CTRL.Kp*ey + CTRL.Ki*Iy + CTRL.Kd*dey;
+
+    % Saturación por Vmax
+    vnorm = hypot(vx_cmd, vy_cmd);
+    if vnorm > P.Vmax
+        scale = P.Vmax / vnorm;
+        vx_cmd = vx_cmd*scale;
+        vy_cmd = vy_cmd*scale;
+    end
+    vCmdLog(:,k) = [vx_cmd; vy_cmd];
+
+    % ---- Disturbios: seno + turbulencia
+    dx_sin = D.Ax*sin(2*pi*D.fx*t(k) + D.phix);
+    dy_sin = D.Ay*sin(2*pi*D.fy*t(k) + D.phiy);
+
+    % ruido coloreado: turb_dot = -(1/tau)*turb + (sigma)*w
+    turb_x = turb_x + Ts*((-turb_x/D.tau_turb) + D.sigma_turb*randn);
+    turb_y = turb_y + Ts*((-turb_y/D.tau_turb) + D.sigma_turb*randn);
+
+    dx = dx_sin + turb_x;
+    dy = dy_sin + turb_y;
+
+    % ---- Planta (Euler)
+    x  = xTrue(1,k-1); y  = xTrue(2,k-1);
+    vx = xTrue(3,k-1); vy = xTrue(4,k-1);
+
+    ax = (1/P.tau_v)*(vx_cmd - vx) + dx;
+    ay = (1/P.tau_v)*(vy_cmd - vy) + dy;
+
+    vx = vx + Ts*ax;
+    vy = vy + Ts*ay;
+    x  = x  + Ts*vx;
+    y  = y  + Ts*vy;
+
+    % límites del parque
+    x = min(max(x, 0), P.mapSize_km);
+    y = min(max(y, 0), P.mapSize_km);
+
+    xTrue(:,k) = [x;y;vx;vy];
+end
+
+%% Plot rápido
+figure('Color','w'); hold on; grid on; axis equal;
+plot(ref.x, ref.y, 'k--', 'LineWidth', 1.2);
+plot(xTrue(1,:), xTrue(2,:), 'b', 'LineWidth', 1.4);
+plot(xHat(1,:), xHat(2,:), 'r', 'LineWidth', 1.0);
+xlabel('x (km)'); ylabel('y (km)');
+title(sprintf('Trayectoria zig-zag (%s) + Control %s + Kalman', P.mission, CTRL.type));
+legend('Referencia','Real','Estimada');
+
+%% Exportar GIF (representación corta)
+gifFile = 'drone_sim.gif';
+makeGIF = true;
+
+if makeGIF
+    figure('Color','w');
+    axis([0 P.mapSize_km 0 P.mapSize_km]); axis equal; grid on; hold on;
+    xlabel('x (km)'); ylabel('y (km)');
+    title('Dron: referencia vs real (con mediciones y fusión)');
+
+    stepFrame = round(0.5/Ts); % 1 frame cada 0.5 s sim
+    for k = 1:stepFrame:N
+        cla;
+
+        % Malla ligera (cada 5 km)
+        for gx = 0:5:P.mapSize_km
+            plot([gx gx],[0 P.mapSize_km], 'Color',[0.9 0.9 0.9]);
+        end
+        for gy = 0:5:P.mapSize_km
+            plot([0 P.mapSize_km],[gy gy], 'Color',[0.9 0.9 0.9]);
+        end
+
+        plot(ref.x, ref.y, 'k--', 'LineWidth', 1.0);
+        plot(xTrue(1,1:k), xTrue(2,1:k), 'b', 'LineWidth', 1.4);
+        plot(xHat(1,1:k),  xHat(2,1:k),  'r', 'LineWidth', 1.0);
+
+        % Posición actual
+        plot(xTrue(1,k), xTrue(2,k), 'bo', 'MarkerFaceColor','b');
+
+        % Footprint de detección (cuadro centrado en dron)
+        fp = P.footprint_km;
+        rectangle('Position',[xTrue(1,k)-fp/2, xTrue(2,k)-fp/2, fp, fp], ...
+                  'EdgeColor',[0 0.5 0], 'LineWidth', 1.2);
+
+        % última medición
+        if ~any(isnan(zLog(:,k)))
+            z = zLog(:,k);
+            switch zType(k)
+                case "GPS_GOOD"
+                    mk = 'g.';
+                case "GPS_BAD"
+                    mk = 'm.';
+                otherwise
+                    mk = 'c.';
+            end
+            plot(z(1), z(2), mk, 'MarkerSize', 18);
+        end
+
+        text(1, P.mapSize_km-2, sprintf('t = %.1f s | %s', t(k), zType(k)));
+
+        drawnow;
+
+        frame = getframe(gcf);
+        im = frame2im(frame);
+        [Amap, map] = rgb2ind(im, 256);
+
+        if k == 1
+            imwrite(Amap, map, gifFile, 'gif', 'LoopCount', inf, 'DelayTime', 0.08);
+        else
+            imwrite(Amap, map, gifFile, 'gif', 'WriteMode', 'append', 'DelayTime', 0.08);
+        end
+    end
+    fprintf('GIF guardado: %s\n', gifFile);
+end
+
+
+%% --------- Funciones locales ---------
+function wps = generateZigZagWaypoints(mapSize_km, margin_km, passSpacing_km)
+    % Genera waypoints tipo lawnmower dentro del cuadrado [0,mapSize]
+    x0 = margin_km;
+    x1 = mapSize_km - margin_km;
+    y0 = margin_km;
+    y1 = mapSize_km - margin_km;
+
+    ys = y0:passSpacing_km:y1;
+    if ys(end) ~= y1
+        ys = [ys y1];
+    end
+
+    wps = [];
+    dir = 1;
+    for i = 1:numel(ys)
+        y = ys(i);
+        if dir > 0
+            wps = [wps; x0 y; x1 y]; 
+        else
+            wps = [wps; x1 y; x0 y]; 
+        end
+        dir = -dir;
+    end
+end
+
+function ref = makeReferenceFromWaypoints(wps, t, vNom_kmps)
+    % Convierte waypoints a referencia continua avanzando a velocidad nominal.
+    N = numel(t);
+    ref.x = zeros(1,N);
+    ref.y = zeros(1,N);
+
+    idxWp = 1;
+    p = wps(1,:)';
+    ref.x(1) = p(1); ref.y(1) = p(2);
+
+    for k = 2:N
+        if idxWp >= size(wps,1)
+            ref.x(k:end) = p(1);
+            ref.y(k:end) = p(2);
+            break;
+        end
+
+        pNext = wps(idxWp+1,:)';
+        d = pNext - p;
+        dist = norm(d);
+
+        if dist < 1e-9
+            idxWp = idxWp + 1;
+            continue;
+        end
+
+        step = vNom_kmps * (t(k)-t(k-1));
+        if step >= dist
+            p = pNext;
+            idxWp = idxWp + 1;
+        else
+            p = p + (step/dist)*d;
+        end
+
+        ref.x(k) = p(1);
+        ref.y(k) = p(2);
+    end
+end
